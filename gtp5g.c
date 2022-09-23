@@ -663,6 +663,24 @@ static struct gtp5g_pdr *pdr_find_by_ipv4(struct gtp5g_dev *gtp, struct sk_buff 
     return NULL;
 }
 
+static struct gtp5g_pdr *pdr_find_by_mark(struct gtp5g_dev *gtp, struct sk_buff *skb)
+{
+    struct hlist_head *head;
+    struct gtp5g_pdr *pdr;
+
+    head = &gtp->addr_hash[ipv4_hashfn(skb->mark) % gtp->hash_size];
+
+    hlist_for_each_entry_rcu(pdr, head, hlist_addr) {
+        // TODO: Move the value we check into first level
+        if (!(pdr->pdi->ue_addr_ipv4->s_addr == skb->mark))
+            continue;
+
+        return pdr;
+    }
+
+    return NULL;
+}
+
 static int pdr_fill(struct gtp5g_pdr *pdr, struct gtp5g_dev *gtp, struct genl_info *info)
 {
     struct nlattr *pdi_attrs[GTP5G_PDI_ATTR_MAX + 1];
@@ -1359,7 +1377,7 @@ static int gtp5g_handle_skb_ipv4(struct sk_buff *skb, struct net_device *dev,
     if (gtp->role == GTP5G_ROLE_UPF)
         pdr = pdr_find_by_ipv4(gtp, skb, 0, iph->daddr);
     else
-        pdr = pdr_find_by_ipv4(gtp, skb, 0, iph->saddr);
+        pdr = pdr_find_by_mark(gtp, skb);
 
     if (!pdr) {
         GTP5G_ERR(dev, "no PDR found for %pI4, skip\n",
@@ -1814,7 +1832,7 @@ static void gtp5g_encap_destroy(struct sock *sk)
     rtnl_unlock();
 }
 
-static struct gtp5g_pdr *pdr_find_by_gtp1u(struct gtp5g_dev *gtp, struct sk_buff *skb,
+static struct gtp5g_pdr *pdr_find_by_gtp1u_toipv4(struct gtp5g_dev *gtp, struct sk_buff *skb,
                                   unsigned int hdrlen, u32 teid)
 {
     struct iphdr *iph;
@@ -1853,6 +1871,40 @@ static struct gtp5g_pdr *pdr_find_by_gtp1u(struct gtp5g_dev *gtp, struct sk_buff
         if (pdi->sdf)
             if (!sdf_filter_match(pdi->sdf, skb, hdrlen, GTP5G_SDF_FILTER_OUT))
                 continue;
+
+        return pdr;
+    }
+
+    return NULL;
+}
+
+static struct gtp5g_pdr *pdr_find_by_gtp1u_tomark(struct gtp5g_dev *gtp, struct sk_buff *skb,
+                                  unsigned int hdrlen, u32 teid)
+{
+    struct iphdr *iph;
+    struct hlist_head *head;
+    struct gtp5g_pdr *pdr;
+    struct gtp5g_pdi *pdi;
+
+    switch(ntohs(skb->protocol)) {
+    case ETH_P_IP:
+        break;
+    default:
+        return NULL;
+    }
+
+    if (!pskb_may_pull(skb, hdrlen + sizeof(struct iphdr)))
+        return NULL;
+
+    iph = (struct iphdr *)(skb->data + hdrlen);
+
+    head = &gtp->i_teid_hash[u32_hashfn(teid) % gtp->hash_size];
+    hlist_for_each_entry_rcu(pdr, head, hlist_i_teid) {
+        pdi = pdr->pdi;
+
+        // GTP-U packet must check teid
+        if (!(pdi->f_teid && pdi->f_teid->teid == teid))
+            continue;
 
         return pdr;
     }
@@ -2083,11 +2135,16 @@ static int gtp1u_udp_encap_recv(struct gtp5g_dev *gtp, struct sk_buff *skb)
 
 	//GTP5G_ERR(gtp->dev, "Total header len(%#x)\n", hdrlen);
     //gtp1 = (struct gtpv1_hdr *)(skb->data + sizeof(struct udphdr));
-    pdr = pdr_find_by_gtp1u(gtp, skb, hdrlen, gtpv1->tid);
+    if (gtp->role == GTP5G_ROLE_UPF)
+        pdr = pdr_find_by_gtp1u_toipv4(gtp, skb, hdrlen, gtpv1->tid);
+    else
+        pdr = pdr_find_by_gtp1u_tomark(gtp, skb, hdrlen, gtpv1->tid);
     if (!pdr) {
         GTP5G_ERR(gtp->dev, "No PDR match this skb : teid[%d]\n", ntohl(gtpv1->tid));
         return -1;
     }
+    if (gtp->role == GTP5G_ROLE_RAN)
+        skb->mark = pdr->pdi->ue_addr_ipv4->s_addr;
 
     return gtp5g_rx(pdr, skb, hdrlen, gtp->role);
 }
